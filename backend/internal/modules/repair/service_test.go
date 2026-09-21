@@ -3,6 +3,7 @@ package repair_test
 import (
 	"context"
 	"net/http"
+	"path/filepath"
 	"testing"
 
 	"github.com/glebarez/sqlite"
@@ -17,7 +18,8 @@ import (
 	"streetlight/internal/modules/repair"
 )
 
-// harness 使用内存数据库装配真实模块, 用于验证跨模块业务流程。
+// harness 使用真实文件数据库(WAL)装配真实模块, 允许多连接并发,
+// 用于验证跨模块业务流程与并发重复提交行为。
 type harness struct {
 	lamps   *lamp.Service
 	faults  *fault.Service
@@ -28,7 +30,9 @@ type harness struct {
 func newHarness(t *testing.T) *harness {
 	t.Helper()
 
-	db, err := gorm.Open(sqlite.Open("file::memory:"), &gorm.Config{
+	dsn := "file:" + filepath.Join(t.TempDir(), "regtest.db") +
+		"?_pragma=busy_timeout(10000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)&_txlock=immediate"
+	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{
 		Logger:         logger.Default.LogMode(logger.Silent),
 		NamingStrategy: schema.NamingStrategy{SingularTable: true},
 	})
@@ -36,7 +40,10 @@ func newHarness(t *testing.T) *harness {
 
 	sqlDB, err := db.DB()
 	require.NoError(t, err)
-	sqlDB.SetMaxOpenConns(1)
+	// 多连接才能制造真实并发; WAL + busy_timeout 保证写写串行等待而非直接报错。
+	sqlDB.SetMaxOpenConns(8)
+	sqlDB.SetMaxIdleConns(8)
+	t.Cleanup(func() { _ = sqlDB.Close() })
 
 	require.NoError(t, db.AutoMigrate(&lamp.Lamp{}, &fault.Fault{}, &repair.Repair{}))
 
@@ -80,12 +87,13 @@ func (h *harness) createFault(t *testing.T, lampID uint, description string) *fa
 }
 
 // requireConflict 断言错误是 409 业务冲突。
-func requireConflict(t *testing.T, err error) {
+func requireConflict(t *testing.T, err error, msgAndArgs ...any) {
 	t.Helper()
-	require.Error(t, err)
+	require.Error(t, err, msgAndArgs...)
 	businessErr, ok := apperr.As(err)
-	require.True(t, ok, "期望业务错误, 实际: %v", err)
-	require.Equal(t, http.StatusConflict, businessErr.Status, "错误信息: %s", businessErr.Message)
+	require.True(t, ok, "期望业务错误, 实际: %v (%v)", err, msgAndArgs)
+	require.Equal(t, http.StatusConflict, businessErr.Status,
+		"错误信息: %s (%v)", businessErr.Message, msgAndArgs)
 }
 
 func TestFaultRepairLifecycle(t *testing.T) {

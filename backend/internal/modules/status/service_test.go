@@ -2,7 +2,9 @@ package status_test
 
 import (
 	"context"
+	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/require"
@@ -17,16 +19,22 @@ import (
 )
 
 type harness struct {
-	lamps   *lamp.Service
-	faults  *fault.Service
-	repairs *repair.Service
-	status  *status.Service
+	lamps      *lamp.Service
+	faults     *fault.Service
+	repairs    *repair.Service
+	status     *status.Service
+	lampRepo   *lamp.Repository
+	faultRepo  *fault.Repository
+	repairRepo *repair.Repository
+	db         *gorm.DB
 }
 
 func newHarness(t *testing.T) *harness {
 	t.Helper()
 
-	db, err := gorm.Open(sqlite.Open("file::memory:"), &gorm.Config{
+	dsn := "file:" + filepath.Join(t.TempDir(), "statustest.db") +
+		"?_pragma=busy_timeout(10000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)&_txlock=immediate"
+	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{
 		Logger:         logger.Default.LogMode(logger.Silent),
 		NamingStrategy: schema.NamingStrategy{SingularTable: true},
 	})
@@ -34,7 +42,9 @@ func newHarness(t *testing.T) *harness {
 
 	sqlDB, err := db.DB()
 	require.NoError(t, err)
-	sqlDB.SetMaxOpenConns(1)
+	sqlDB.SetMaxOpenConns(8)
+	sqlDB.SetMaxIdleConns(8)
+	t.Cleanup(func() { _ = sqlDB.Close() })
 
 	require.NoError(t, db.AutoMigrate(&lamp.Lamp{}, &fault.Fault{}, &repair.Repair{}))
 
@@ -49,10 +59,14 @@ func newHarness(t *testing.T) *harness {
 	repairService := repair.NewService(repairRepository, faultService)
 
 	return &harness{
-		lamps:   lampService,
-		faults:  faultService,
-		repairs: repairService,
-		status:  status.NewService(db, lampRepository, faultRepository, repairRepository),
+		lamps:      lampService,
+		faults:     faultService,
+		repairs:    repairService,
+		lampRepo:   lampRepository,
+		faultRepo:  faultRepository,
+		repairRepo: repairRepository,
+		db:         db,
+		status:     status.NewService(db, lampRepository, faultRepository, repairRepository),
 	}
 }
 
@@ -79,6 +93,44 @@ func (h *harness) createFault(t *testing.T, lampID uint, faultType string) *faul
 	})
 	require.NoError(t, err)
 	return entity
+}
+
+// createFaultAt 在指定时刻登记故障, 用于构造逾期/时间线场景。
+func (h *harness) createFaultAt(t *testing.T, lampID uint, reportedAt time.Time, description string) *fault.Fault {
+	t.Helper()
+	entity, err := h.faults.Create(context.Background(), fault.CreateRequest{
+		LampID:      lampID,
+		FaultType:   "灯不亮",
+		FaultLevel:  fault.LevelHigh,
+		Description: description,
+		Reporter:    "巡检员",
+		ReportedAt:  reportedAt.Format("2006-01-02 15:04:05"),
+	})
+	require.NoError(t, err)
+	return entity
+}
+
+// startRepairAt 在指定时刻开工。
+func (h *harness) startRepairAt(t *testing.T, faultID uint, repairman string, startedAt time.Time) *repair.Repair {
+	t.Helper()
+	record, err := h.repairs.Create(context.Background(), repair.CreateRequest{
+		FaultID:   faultID,
+		Repairman: repairman,
+		StartedAt: startedAt.Format("2006-01-02 15:04:05"),
+	})
+	require.NoError(t, err)
+	return record
+}
+
+// finishRepairAt 在指定时刻以指定结果完工。
+func (h *harness) finishRepairAt(t *testing.T, record *repair.Repair, result string, finishedAt time.Time) *repair.Repair {
+	t.Helper()
+	finished, err := h.repairs.Finish(context.Background(), record.ID, repair.FinishRequest{
+		Result:     result,
+		FinishedAt: finishedAt.Format("2006-01-02 15:04:05"),
+	})
+	require.NoError(t, err)
+	return finished
 }
 
 func intPointer(value int) *int { return &value }

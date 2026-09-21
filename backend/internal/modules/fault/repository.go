@@ -11,6 +11,7 @@ import (
 	"gorm.io/gorm"
 
 	"streetlight/internal/apperr"
+	"streetlight/internal/database"
 	"streetlight/pkg/pagination"
 )
 
@@ -39,7 +40,21 @@ func NewRepository(db *gorm.DB) *Repository {
 }
 
 func (r *Repository) session(ctx context.Context) *gorm.DB {
+	if tx, ok := database.TxFromContext(ctx); ok {
+		return tx.WithContext(ctx)
+	}
 	return r.db.WithContext(ctx)
+}
+
+// InTransaction 在事务中执行 fn; 若 ctx 已携带事务则直接复用, 支持嵌套调用。
+func (r *Repository) InTransaction(ctx context.Context, fn func(ctx context.Context) error) error {
+	if tx, ok := database.TxFromContext(ctx); ok {
+		_ = tx
+		return fn(ctx)
+	}
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		return fn(database.WithTx(ctx, tx))
+	})
 }
 
 // Create 新增故障记录。
@@ -62,11 +77,26 @@ func (r *Repository) CreateWithUniqueNo(ctx context.Context, entity *Fault, pref
 		if err == nil {
 			return nil
 		}
+		if isOpenFaultDuplicate(err) {
+			// 命中 "同一路灯仅一条未闭环故障" 的部分唯一索引, 属于业务冲突, 不再重试单号。
+			return apperr.Conflict("路灯 %s 已存在未闭环故障, 请先闭环后再登记", entity.LampCode)
+		}
 		if !isUniqueViolation(err) {
 			return err
 		}
 	}
 	return apperr.Conflict("故障单号生成冲突, 请稍后重试")
+}
+
+// isOpenFaultDuplicate 判断唯一约束冲突是否来自 idx_fault_lamp_open(同灯未闭环唯一)。
+// sqlite 报错携带列名(lamp_id), postgres 报错携带索引名, 两者都需要兼容。
+func isOpenFaultDuplicate(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "idx_fault_lamp_open") ||
+		(strings.Contains(message, "unique") && strings.Contains(message, "lamp_id"))
 }
 
 // NextSequence 返回指定前缀下可用的下一个流水号。
@@ -111,6 +141,33 @@ func (r *Repository) UpdateColumns(ctx context.Context, id uint, columns map[str
 		return apperr.NotFound("故障记录不存在: id=%d", id)
 	}
 	return nil
+}
+
+// TransitionStatus 在 WHERE 中带当前状态守卫地更新故障, 返回是否真的更新了一行。
+// 用于状态流转类操作, 保证并发/重复提交时只有一个请求能成功, 其余拿到 false。
+func (r *Repository) TransitionStatus(ctx context.Context, id uint, expectStatuses []string, columns map[string]any) (bool, error) {
+	if len(columns) == 0 {
+		return false, nil
+	}
+	result := r.session(ctx).Model(&Fault{}).
+		Where("id = ? AND status IN ?", id, expectStatuses).
+		Updates(columns)
+	if result.Error != nil {
+		return false, fmt.Errorf("更新故障状态失败: %w", result.Error)
+	}
+	return result.RowsAffected > 0, nil
+}
+
+// UpdateFieldsUnlessStatus 带状态排除守卫地更新字段, 用于编辑类操作:
+// 故障在读取后被关闭时, 更新命中 0 行并返回 false, 避免旧数据覆盖终态。
+func (r *Repository) UpdateFieldsUnlessStatus(ctx context.Context, id uint, forbiddenStatus string, columns map[string]any) (bool, error) {
+	result := r.session(ctx).Model(&Fault{}).
+		Where("id = ? AND status <> ?", id, forbiddenStatus).
+		Updates(columns)
+	if result.Error != nil {
+		return false, fmt.Errorf("更新故障失败: %w", result.Error)
+	}
+	return result.RowsAffected > 0, nil
 }
 
 // Delete 按主键删除故障。

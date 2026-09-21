@@ -2,7 +2,6 @@ package fault
 
 import (
 	"context"
-	"log/slog"
 	"strings"
 	"time"
 
@@ -75,18 +74,11 @@ func (s *Service) ListByLamp(ctx context.Context, lampID uint) ([]Fault, error) 
 }
 
 // Create 登记故障: 校验路灯存在、无未闭环故障后落库, 并同步路灯运行状态。
-func (s *Service) Create(ctx context.Context, req CreateRequest) (*Fault, error) {
+// 写库与路灯状态联动在同一事务内完成, 任何一步失败都整体回滚。
+func (s *Service) Create(ctx context.Context, req CreateRequest) (entity *Fault, err error) {
 	device, err := s.lamps.Get(ctx, req.LampID)
 	if err != nil {
 		return nil, err
-	}
-
-	openCount, err := s.repo.CountOpenByLamp(ctx, device.ID)
-	if err != nil {
-		return nil, err
-	}
-	if openCount > 0 {
-		return nil, apperr.Conflict("路灯 %s 已存在 %d 条未闭环故障, 请先处理后再登记", device.Code, openCount)
 	}
 
 	faultType := strings.TrimSpace(req.FaultType)
@@ -113,7 +105,7 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (*Fault, error)
 		return nil, err
 	}
 
-	entity := &Fault{
+	entity = &Fault{
 		LampID:        device.ID,
 		LampCode:      device.Code,
 		RoadName:      device.RoadName,
@@ -127,17 +119,28 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (*Fault, error)
 		Status:        StatusPending,
 	}
 
-	if err := s.repo.CreateWithUniqueNo(ctx, entity, faultNoPrefix(reportedAt)); err != nil {
-		return nil, err
-	}
+	err = s.repo.InTransaction(ctx, func(txCtx context.Context) error {
+		openCount, err := s.repo.CountOpenByLamp(txCtx, device.ID)
+		if err != nil {
+			return err
+		}
+		if openCount > 0 {
+			return apperr.Conflict("路灯 %s 已存在 %d 条未闭环故障, 请先处理后再登记", device.Code, openCount)
+		}
 
-	if err := s.syncLampStatus(ctx, device.ID); err != nil {
-		slog.Warn("同步路灯运行状态失败", "lamp_id", device.ID, "fault_no", entity.FaultNo, "error", err)
+		if err := s.repo.CreateWithUniqueNo(txCtx, entity, faultNoPrefix(reportedAt)); err != nil {
+			return err
+		}
+		return s.syncLampStatus(txCtx, device.ID)
+	})
+	if err != nil {
+		return nil, err
 	}
 	return entity, nil
 }
 
 // Update 修改故障登记信息, 已关闭的故障不允许修改。
+// 条件更新保证: 读取后若故障被其它请求关闭, 修改不会覆盖终态。
 func (s *Service) Update(ctx context.Context, id uint, req UpdateRequest) (*Fault, error) {
 	entity, err := s.repo.GetByID(ctx, id)
 	if err != nil {
@@ -147,49 +150,57 @@ func (s *Service) Update(ctx context.Context, id uint, req UpdateRequest) (*Faul
 		return nil, apperr.Conflict("故障 %s 已关闭, 不允许修改", entity.FaultNo)
 	}
 
+	columns := map[string]any{}
 	if req.FaultType != nil {
 		value := strings.TrimSpace(*req.FaultType)
 		if !isValidFaultType(value) {
 			return nil, apperr.BadRequest("非法的故障类型: %s", value)
 		}
-		entity.FaultType = value
+		columns["fault_type"] = value
 	}
 	if req.FaultLevel != nil {
-		entity.FaultLevel = strings.TrimSpace(*req.FaultLevel)
+		columns["fault_level"] = strings.TrimSpace(*req.FaultLevel)
 	}
 	if req.Source != nil {
-		entity.Source = strings.TrimSpace(*req.Source)
+		columns["source"] = strings.TrimSpace(*req.Source)
 	}
 	if req.Description != nil {
 		value := strings.TrimSpace(*req.Description)
 		if value == "" {
 			return nil, apperr.BadRequest("故障描述不能为空")
 		}
-		entity.Description = value
+		columns["description"] = value
 	}
 	if req.Reporter != nil {
-		entity.Reporter = strings.TrimSpace(*req.Reporter)
+		columns["reporter"] = strings.TrimSpace(*req.Reporter)
 	}
 	if req.ReporterPhone != nil {
-		entity.ReporterPhone = strings.TrimSpace(*req.ReporterPhone)
+		columns["reporter_phone"] = strings.TrimSpace(*req.ReporterPhone)
 	}
 	if req.ReportedAt != nil {
 		value, err := parseReportedAt(*req.ReportedAt)
 		if err != nil {
 			return nil, err
 		}
-		entity.ReportedAt = value
+		columns["reported_at"] = value
 	}
 
-	if err := s.repo.Update(ctx, entity); err != nil {
-		return nil, err
+	if len(columns) > 0 {
+		ok, err := s.repo.UpdateFieldsUnlessStatus(ctx, id, StatusClosed, columns)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			return nil, apperr.Conflict("故障 %s 已关闭, 不允许修改", entity.FaultNo)
+		}
 	}
-	return entity, nil
+	return s.repo.GetByID(ctx, id)
 }
 
 // Close 关闭故障, 用于确认闭环或作废处理。
-func (s *Service) Close(ctx context.Context, id uint, req CloseRequest) (*Fault, error) {
-	entity, err := s.repo.GetByID(ctx, id)
+// 使用条件更新守卫当前状态: 同一故障被并发/重复提交关闭时, 只有一次生效。
+func (s *Service) Close(ctx context.Context, id uint, req CloseRequest) (entity *Fault, err error) {
+	entity, err = s.repo.GetByID(ctx, id)
 	if err != nil {
 		return nil, err
 	}
@@ -201,17 +212,48 @@ func (s *Service) Close(ctx context.Context, id uint, req CloseRequest) (*Fault,
 	}
 
 	now := time.Now()
-	entity.Status = StatusClosed
-	entity.ClosedAt = &now
-	entity.CloseRemark = strings.TrimSpace(req.Remark)
-
-	if err := s.repo.Update(ctx, entity); err != nil {
+	columns := map[string]any{
+		"status":       StatusClosed,
+		"closed_at":    now,
+		"close_remark": strings.TrimSpace(req.Remark),
+	}
+	err = s.repo.InTransaction(ctx, func(txCtx context.Context) error {
+		ok, err := s.repo.TransitionStatus(txCtx, id, validSourceStatuses(StatusClosed), columns)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			// 状态在读取后被其它请求改变, 重新读取以给出准确的冲突原因。
+			current, getErr := s.repo.GetByID(txCtx, id)
+			if getErr != nil {
+				return getErr
+			}
+			if current.Status == StatusClosed {
+				return apperr.Conflict("故障 %s 已关闭, 无需重复操作", current.FaultNo)
+			}
+			return apperr.Conflict("故障 %s 当前状态为 %s, 不允许关闭", current.FaultNo, StatusLabel(current.Status))
+		}
+		return s.syncLampStatus(txCtx, entity.LampID)
+	})
+	if err != nil {
 		return nil, err
 	}
-	if err := s.syncLampStatus(ctx, entity.LampID); err != nil {
-		slog.Warn("同步路灯运行状态失败", "lamp_id", entity.LampID, "fault_no", entity.FaultNo, "error", err)
-	}
+	entity.Status = StatusClosed
+	entity.ClosedAt = &now
+	entity.CloseRemark = columns["close_remark"].(string)
 	return entity, nil
+}
+
+// validSourceStatuses 返回状态机中允许流转到 target 的全部源状态(不含 target 自身),
+// 供条件更新构造 WHERE status IN (...) 守卫; 停留在 target 上的重复提交会被挡下。
+func validSourceStatuses(target string) []string {
+	result := make([]string, 0, 4)
+	for _, from := range Statuses() {
+		if from != target && canTransitTo(from, target) {
+			result = append(result, from)
+		}
+	}
+	return result
 }
 
 // Delete 删除故障, 仅允许删除已关闭且没有维修记录的故障。
@@ -226,13 +268,12 @@ func (s *Service) Delete(ctx context.Context, id uint) error {
 	if entity.RepairCount > 0 {
 		return apperr.Conflict("该故障已产生 %d 条维修记录, 不允许删除", entity.RepairCount)
 	}
-	if err := s.repo.Delete(ctx, id); err != nil {
-		return err
-	}
-	if err := s.syncLampStatus(ctx, entity.LampID); err != nil {
-		slog.Warn("同步路灯运行状态失败", "lamp_id", entity.LampID, "error", err)
-	}
-	return nil
+	return s.repo.InTransaction(ctx, func(txCtx context.Context) error {
+		if err := s.repo.Delete(txCtx, id); err != nil {
+			return err
+		}
+		return s.syncLampStatus(txCtx, entity.LampID)
+	})
 }
 
 // Metadata 返回故障模块字典。
@@ -245,22 +286,33 @@ func (s *Service) Metadata() *Meta {
 	}
 }
 
-// OnRepairStarted 维修开工: 故障进入维修中, 维修次数累加, 并同步路灯状态。
-func (s *Service) OnRepairStarted(ctx context.Context, faultID uint, repairID uint) error {
+// OnRepairStarted 维修开工: 故障进入维修中, 并写入维修次数与最近维修记录。
+// repairCount / latestRepairID 由维修模块在同一事务内落库后重新统计得出,
+// 因此补录较早的开工记录不会把 latest_repair_id 错误指向旧记录。
+// 条件更新保证: 终态(已关闭)故障不会被驱动, 并发重复开工只有一次生效。
+func (s *Service) OnRepairStarted(ctx context.Context, faultID uint, repairCount int, latestRepairID *uint) error {
 	entity, err := s.repo.GetByID(ctx, faultID)
 	if err != nil {
 		return err
 	}
-	if !canTransitTo(entity.Status, StatusProcessing) {
-		return apperr.Conflict("故障 %s 当前状态为 %s, 不允许开工维修", entity.FaultNo, StatusLabel(entity.Status))
+
+	columns := map[string]any{
+		"status":           StatusProcessing,
+		"repair_count":     repairCount,
+		"latest_repair_id": latestRepairID,
 	}
-
-	entity.Status = StatusProcessing
-	entity.RepairCount++
-	entity.LatestRepairID = &repairID
-
-	if err := s.repo.Update(ctx, entity); err != nil {
+	// pending 首次开工 / processing 返修(上一次结果非已修复) / repaired 回退返修 都合法。
+	ok, err := s.repo.TransitionStatus(ctx, faultID,
+		[]string{StatusPending, StatusProcessing, StatusRepaired}, columns)
+	if err != nil {
 		return err
+	}
+	if !ok {
+		current, getErr := s.repo.GetByID(ctx, faultID)
+		if getErr != nil {
+			return getErr
+		}
+		return apperr.Conflict("故障 %s 当前状态为 %s, 不允许开工维修", current.FaultNo, StatusLabel(current.Status))
 	}
 	return s.syncLampStatus(ctx, entity.LampID)
 }
@@ -272,18 +324,28 @@ func (s *Service) OnRepairFinished(ctx context.Context, faultID uint, fixed bool
 		return err
 	}
 	if fixed {
-		if !canTransitTo(entity.Status, StatusRepaired) {
-			return apperr.Conflict("故障 %s 当前状态为 %s, 无法标记为已修复", entity.FaultNo, StatusLabel(entity.Status))
-		}
-		entity.Status = StatusRepaired
-		if err := s.repo.Update(ctx, entity); err != nil {
+		ok, err := s.repo.TransitionStatus(ctx, faultID,
+			[]string{StatusProcessing}, map[string]any{"status": StatusRepaired})
+		if err != nil {
 			return err
+		}
+		if !ok {
+			current, getErr := s.repo.GetByID(ctx, faultID)
+			if getErr != nil {
+				return getErr
+			}
+			if current.Status == StatusRepaired {
+				return apperr.Conflict("故障 %s 已修复, 请勿重复提交完工结果", current.FaultNo)
+			}
+			return apperr.Conflict("故障 %s 当前状态为 %s, 无法标记为已修复", current.FaultNo, StatusLabel(current.Status))
 		}
 	}
 	return s.syncLampStatus(ctx, entity.LampID)
 }
 
 // SyncRepairStats 同步维修次数与最新维修记录, 删除维修记录后回退未开工状态。
+// 次数归零时: 维修中/已修复的故障都回退到待处理(唯一能把它推到这两个状态的
+// 维修记录已不存在); 已关闭终态不受影响(其维修记录本来就禁止删除)。
 func (s *Service) SyncRepairStats(ctx context.Context, faultID uint, repairCount int, latestRepairID *uint) error {
 	entity, err := s.repo.GetByID(ctx, faultID)
 	if err != nil {
@@ -294,8 +356,11 @@ func (s *Service) SyncRepairStats(ctx context.Context, faultID uint, repairCount
 		"repair_count":     repairCount,
 		"latest_repair_id": latestRepairID,
 	}
-	if repairCount == 0 && entity.Status == StatusProcessing {
-		columns["status"] = StatusPending
+	if repairCount == 0 {
+		switch entity.Status {
+		case StatusProcessing, StatusRepaired:
+			columns["status"] = StatusPending
+		}
 	}
 
 	if err := s.repo.UpdateColumns(ctx, faultID, columns); err != nil {

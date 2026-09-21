@@ -1,6 +1,7 @@
 <template>
   <div class="page">
     <PageHeader title="维修状态查询" description="按路灯维度查看当前故障与最近一次维修进展, 快速定位滞留工单">
+      <el-button :icon="Download" @click="exportRows">导出 CSV</el-button>
       <el-button :icon="Refresh" @click="load">刷新</el-button>
     </PageHeader>
 
@@ -83,7 +84,8 @@
 <script setup>
 import { onMounted } from 'vue'
 import { useRouter } from 'vue-router'
-import { Refresh, RefreshLeft, Search } from '@element-plus/icons-vue'
+import { Download, Refresh, RefreshLeft, Search } from '@element-plus/icons-vue'
+import { ElMessage } from 'element-plus'
 import PageHeader from '@/components/common/PageHeader.vue'
 import StatusTag from '@/components/common/StatusTag.vue'
 import DataPagination from '@/components/common/DataPagination.vue'
@@ -105,6 +107,23 @@ const { loading, rows, total, query, load, search, reset, changePage, changePage
 
 function goTrack(params) {
   router.push({ path: '/status/track', query: params })
+}
+
+// exportRows 按当前过滤条件导出 CSV(与列表同源, 口径一致)。
+async function exportRows() {
+  try {
+    const blob = await statusApi.exportLamps({ ...query })
+    const url = window.URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = `streetlight-status-${new Date().toISOString().slice(0, 10)}.csv`
+    document.body.appendChild(link)
+    link.click()
+    document.body.removeChild(link)
+    window.URL.revokeObjectURL(url)
+  } catch {
+    // 错误提示已由 axios 拦截器统一处理。
+  }
 }
 
 onMounted(() => {

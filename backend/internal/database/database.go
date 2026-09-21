@@ -67,7 +67,7 @@ func sqliteDSN(dsn string) string {
 	if !strings.HasPrefix(dsn, "file:") {
 		dsn = "file:" + dsn
 	}
-	return dsn + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)"
+	return dsn + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)&_txlock=immediate"
 }
 
 // ensureDir 保证 sqlite 数据文件所在目录存在。

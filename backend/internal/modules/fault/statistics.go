@@ -61,31 +61,32 @@ func (r *Repository) CountReportedBetween(ctx context.Context, from, to time.Tim
 	return total, nil
 }
 
-// CountPendingBefore 统计 before 之前登记且仍未开工的故障数量, 用于超期预警。
-func (r *Repository) CountPendingBefore(ctx context.Context, before time.Time) (int64, error) {
+// CountOpenBefore 统计 before 之前登记且仍未闭环(待处理 + 维修中)的故障数量。
+// 逾期口径与业务约定一致: 上报超过阈值仍未闭环即逾期, 与故障是否已经开工无关。
+func (r *Repository) CountOpenBefore(ctx context.Context, before time.Time) (int64, error) {
 	var total int64
 	err := r.session(ctx).Model(&Fault{}).
-		Where("status = ? AND reported_at < ?", StatusPending, before).
+		Where("status IN ? AND reported_at < ?", []string{StatusPending, StatusProcessing}, before).
 		Count(&total).Error
 	if err != nil {
-		return 0, fmt.Errorf("统计超期未处理故障失败: %w", err)
+		return 0, fmt.Errorf("统计超期未闭环故障失败: %w", err)
 	}
 	return total, nil
 }
 
-// ListPendingBefore 查询 before 之前登记且仍未开工的故障。
-func (r *Repository) ListPendingBefore(ctx context.Context, before time.Time, limit int) ([]Fault, error) {
+// ListOpenBefore 查询 before 之前登记且仍未闭环的故障, 按滞留时间倒序(最早上报在前)。
+func (r *Repository) ListOpenBefore(ctx context.Context, before time.Time, limit int) ([]Fault, error) {
 	if limit <= 0 {
 		limit = 10
 	}
 	entities := make([]Fault, 0)
 	err := r.session(ctx).Model(&Fault{}).
-		Where("status = ? AND reported_at < ?", StatusPending, before).
+		Where("status IN ? AND reported_at < ?", []string{StatusPending, StatusProcessing}, before).
 		Order("reported_at ASC, id ASC").
 		Limit(limit).
 		Find(&entities).Error
 	if err != nil {
-		return nil, fmt.Errorf("查询超期未处理故障失败: %w", err)
+		return nil, fmt.Errorf("查询超期未闭环故障失败: %w", err)
 	}
 	return entities, nil
 }

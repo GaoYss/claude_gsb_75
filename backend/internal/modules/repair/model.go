@@ -38,9 +38,11 @@ func IsValidResult(result string) bool {
 
 // Repair 维修记录, 一条记录对应故障的一次维修过程。
 type Repair struct {
-	ID           uint       `gorm:"primaryKey" json:"id"`
-	RepairNo     string     `gorm:"size:64;uniqueIndex;not null" json:"repair_no"`
-	FaultID      uint       `gorm:"index;not null" json:"fault_id"`
+	ID       uint   `gorm:"primaryKey" json:"id"`
+	RepairNo string `gorm:"size:64;uniqueIndex;not null" json:"repair_no"`
+	// FaultID 上的部分唯一索引保证同一故障同时只存在一条进行中的维修记录,
+	// 把"重复开工"防护下沉到数据库层, 兼容并发重复提交。
+	FaultID      uint       `gorm:"index;not null;uniqueIndex:idx_repair_fault_ongoing,where:status = 'ongoing'" json:"fault_id"`
 	FaultNo      string     `gorm:"size:64;index" json:"fault_no"`
 	LampID       uint       `gorm:"index" json:"lamp_id"`
 	LampCode     string     `gorm:"size:64;index" json:"lamp_code"`

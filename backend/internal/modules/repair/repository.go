@@ -11,6 +11,7 @@ import (
 	"gorm.io/gorm"
 
 	"streetlight/internal/apperr"
+	"streetlight/internal/database"
 	"streetlight/pkg/pagination"
 )
 
@@ -38,7 +39,20 @@ func NewRepository(db *gorm.DB) *Repository {
 }
 
 func (r *Repository) session(ctx context.Context) *gorm.DB {
+	if tx, ok := database.TxFromContext(ctx); ok {
+		return tx.WithContext(ctx)
+	}
 	return r.db.WithContext(ctx)
+}
+
+// InTransaction 在事务中执行 fn; 若 ctx 已携带事务则直接复用, 支持嵌套调用。
+func (r *Repository) InTransaction(ctx context.Context, fn func(ctx context.Context) error) error {
+	if _, ok := database.TxFromContext(ctx); ok {
+		return fn(ctx)
+	}
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		return fn(database.WithTx(ctx, tx))
+	})
 }
 
 // Create 新增维修记录。
@@ -61,11 +75,40 @@ func (r *Repository) CreateWithUniqueNo(ctx context.Context, entity *Repair, pre
 		if err == nil {
 			return nil
 		}
+		if isOngoingDuplicate(err) {
+			// 命中 "同一故障仅一条进行中维修" 的部分唯一索引, 属于业务冲突。
+			return apperr.Conflict("故障 %s 已有进行中的维修记录, 请先完工后再录入", entity.FaultNo)
+		}
 		if !isUniqueViolation(err) {
 			return err
 		}
 	}
 	return apperr.Conflict("维修单号生成冲突, 请稍后重试")
+}
+
+// isOngoingDuplicate 判断唯一约束冲突是否来自 idx_repair_fault_ongoing(同故障进行中唯一)。
+func isOngoingDuplicate(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "idx_repair_fault_ongoing") ||
+		(strings.Contains(message, "unique") && strings.Contains(message, "fault_id"))
+}
+
+// UpdateWithStatusGuard 带当前状态守卫地更新维修记录, 返回是否更新了一行。
+// 用于完工等状态流转, 并发/重复提交时只有一个请求能成功。
+func (r *Repository) UpdateWithStatusGuard(ctx context.Context, id uint, expectStatus string, columns map[string]any) (bool, error) {
+	if len(columns) == 0 {
+		return false, nil
+	}
+	result := r.session(ctx).Model(&Repair{}).
+		Where("id = ? AND status = ?", id, expectStatus).
+		Updates(columns)
+	if result.Error != nil {
+		return false, fmt.Errorf("更新维修记录失败: %w", result.Error)
+	}
+	return result.RowsAffected > 0, nil
 }
 
 // NextSequence 返回指定前缀下可用的下一个流水号。
@@ -282,7 +325,7 @@ func (r *Repository) AverageDurationHours(ctx context.Context) (float64, error) 
 func (r *Repository) DistinctValues(ctx context.Context, column string) ([]string, error) {
 	values := make([]string, 0)
 	err := r.session(ctx).Model(&Repair{}).
-		Where(column + " <> ''").
+		Where(column+" <> ''").
 		Distinct().
 		Order(column).
 		Pluck(column, &values).Error

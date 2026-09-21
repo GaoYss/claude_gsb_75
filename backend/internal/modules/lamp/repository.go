@@ -10,6 +10,7 @@ import (
 	"gorm.io/gorm"
 
 	"streetlight/internal/apperr"
+	"streetlight/internal/database"
 	"streetlight/pkg/pagination"
 )
 
@@ -24,6 +25,9 @@ func NewRepository(db *gorm.DB) *Repository {
 }
 
 func (r *Repository) session(ctx context.Context) *gorm.DB {
+	if tx, ok := database.TxFromContext(ctx); ok {
+		return tx.WithContext(ctx)
+	}
 	return r.db.WithContext(ctx)
 }
 
@@ -168,7 +172,7 @@ func (r *Repository) CountByColumn(ctx context.Context, column string) (map[stri
 func (r *Repository) DistinctValues(ctx context.Context, column string) ([]string, error) {
 	values := make([]string, 0)
 	err := r.session(ctx).Model(&Lamp{}).
-		Where(column + " <> ''").
+		Where(column+" <> ''").
 		Distinct().
 		Order(column).
 		Pluck(column, &values).Error

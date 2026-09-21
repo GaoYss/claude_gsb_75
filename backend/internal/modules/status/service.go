@@ -110,7 +110,7 @@ func (s *Service) Overview(ctx context.Context) (*Overview, error) {
 	if err != nil {
 		return nil, err
 	}
-	overdueTotal, err := s.faults.CountPendingBefore(ctx, overdueBefore)
+	overdueTotal, err := s.faults.CountOpenBefore(ctx, overdueBefore)
 	if err != nil {
 		return nil, err
 	}
@@ -140,7 +140,7 @@ func (s *Service) Overview(ctx context.Context) (*Overview, error) {
 	if err != nil {
 		return nil, err
 	}
-	overdueFaults, err := s.faults.ListPendingBefore(ctx, overdueBefore, 8)
+	overdueFaults, err := s.faults.ListOpenBefore(ctx, overdueBefore, 8)
 	if err != nil {
 		return nil, err
 	}
@@ -154,6 +154,7 @@ func (s *Service) Overview(ctx context.Context) (*Overview, error) {
 		Fault: FaultSummary{
 			Total:         faultTotal,
 			OpenTotal:     faultOpen,
+			ClosedTotal:   faultByStatus[fault.StatusClosed],
 			ByStatus:      faultByStatus,
 			TodayReported: todayReported,
 			OverdueTotal:  overdueTotal,
@@ -169,8 +170,8 @@ func (s *Service) Overview(ctx context.Context) (*Overview, error) {
 		FaultByType:   topCounts(faultByType, 0),
 		FaultByLevel:  orderedCounts(faultByLevel, fault.Levels()),
 		TopRoads:      topCounts(faultByRoad, 5),
-		RecentFaults:  toBriefs(recentFaults),
-		OverdueFaults: toBriefs(overdueFaults),
+		RecentFaults:  toBriefs(recentFaults, overdueBefore),
+		OverdueFaults: toBriefs(overdueFaults, overdueBefore),
 		OverdueHours:  OverdueThreshold.Hours(),
 		GeneratedAt:   now,
 	}, nil
@@ -179,6 +180,7 @@ func (s *Service) Overview(ctx context.Context) (*Overview, error) {
 // Lamps 查询路灯维修状态列表: 在台账信息之上叠加当前故障与最近一次维修进展。
 func (s *Service) Lamps(ctx context.Context, query LampQuery) ([]LampStatusRow, int64, pagination.Query, error) {
 	page := pagination.Parse(query.Params, lampStatusSortSpec)
+	overdueBefore := time.Now().Add(-OverdueThreshold)
 
 	base := func() *gorm.DB {
 		statement := s.db.WithContext(ctx).Model(&lamp.Lamp{})
@@ -217,9 +219,56 @@ func (s *Service) Lamps(ctx context.Context, query LampQuery) ([]LampStatusRow, 
 		return nil, 0, page, err
 	}
 
+	rows, err := s.assembleLampRows(ctx, devices, overdueBefore)
+	if err != nil {
+		return nil, 0, page, err
+	}
+	return rows, total, page, nil
+}
+
+// ExportRows 返回与 Lamps 完全相同的行数据(不分页), 供导出接口使用,
+// 确保导出内容、页面清单、概览统计三者口径一致。
+func (s *Service) ExportRows(ctx context.Context, query LampQuery) ([]ExportRow, error) {
+	statement := s.db.WithContext(ctx).Model(&lamp.Lamp{})
+	if keyword := strings.TrimSpace(query.Keyword); keyword != "" {
+		like := "%" + keyword + "%"
+		statement = statement.Where(
+			"lamp.code LIKE ? OR lamp.name LIKE ? OR lamp.road_name LIKE ? OR lamp.address LIKE ?",
+			like, like, like, like,
+		)
+	}
+	if value := strings.TrimSpace(query.RoadName); value != "" {
+		statement = statement.Where("lamp.road_name = ?", value)
+	}
+	if value := strings.TrimSpace(query.LampType); value != "" {
+		statement = statement.Where("lamp.lamp_type = ?", value)
+	}
+	if value := strings.TrimSpace(query.RunStatus); value != "" {
+		statement = statement.Where("lamp.run_status = ?", value)
+	}
+	if query.OnlyOpen {
+		statement = statement.Where(
+			"EXISTS (SELECT 1 FROM fault WHERE fault.lamp_id = lamp.id AND fault.status IN ?)",
+			[]string{fault.StatusPending, fault.StatusProcessing},
+		)
+	}
+
+	devices := make([]lamp.Lamp, 0)
+	if err := statement.Order("lamp.id ASC").Find(&devices).Error; err != nil {
+		return nil, err
+	}
+	rows, err := s.assembleLampRows(ctx, devices, time.Now().Add(-OverdueThreshold))
+	if err != nil {
+		return nil, err
+	}
+	return toExportRows(rows), nil
+}
+
+// assembleLampRows 为一批路灯组装状态行, 供分页列表与导出复用, 保证两边口径相同。
+func (s *Service) assembleLampRows(ctx context.Context, devices []lamp.Lamp, overdueBefore time.Time) ([]LampStatusRow, error) {
 	rows := make([]LampStatusRow, 0, len(devices))
 	if len(devices) == 0 {
-		return rows, total, page, nil
+		return rows, nil
 	}
 
 	ids := make([]uint, 0, len(devices))
@@ -229,19 +278,19 @@ func (s *Service) Lamps(ctx context.Context, query LampQuery) ([]LampStatusRow, 
 
 	totalByLamp, err := s.countFaultsByLamp(ctx, ids, false)
 	if err != nil {
-		return nil, 0, page, err
+		return nil, err
 	}
 	openByLamp, err := s.countFaultsByLamp(ctx, ids, true)
 	if err != nil {
-		return nil, 0, page, err
+		return nil, err
 	}
 	currentFaults, err := s.currentFaults(ctx, ids)
 	if err != nil {
-		return nil, 0, page, err
+		return nil, err
 	}
 	latestRepairs, err := s.latestRepairs(ctx, ids)
 	if err != nil {
-		return nil, 0, page, err
+		return nil, err
 	}
 
 	for _, device := range devices {
@@ -263,6 +312,8 @@ func (s *Service) Lamps(ctx context.Context, query LampQuery) ([]LampStatusRow, 
 			row.FaultLevel = current.FaultLevel
 			row.FaultStatus = current.Status
 			row.FaultReported = &reportedAt
+			// 与概览逾期清单同一口径: 未闭环(pending/processing)且上报超过阈值。
+			row.FaultOverdue = fault.IsOpen(current.Status) && reportedAt.Before(overdueBefore)
 		}
 		if latest, ok := latestRepairs[device.ID]; ok {
 			row.RepairNo = latest.RepairNo
@@ -273,7 +324,56 @@ func (s *Service) Lamps(ctx context.Context, query LampQuery) ([]LampStatusRow, 
 		}
 		rows = append(rows, row)
 	}
-	return rows, total, page, nil
+	return rows, nil
+}
+
+// toExportRows 把状态行转换为导出行, 状态值替换为中文标签便于直接阅读。
+func toExportRows(rows []LampStatusRow) []ExportRow {
+	result := make([]ExportRow, 0, len(rows))
+	for _, row := range rows {
+		result = append(result, ExportRow{
+			LampCode:      row.LampCode,
+			LampName:      row.LampName,
+			RoadName:      row.RoadName,
+			RunStatus:     faultStatusSafe(row.RunStatus),
+			TotalFaults:   row.TotalFaults,
+			OpenFaults:    row.OpenFaults,
+			FaultNo:       row.FaultNo,
+			FaultStatus:   fault.StatusLabel(row.FaultStatus),
+			FaultType:     row.FaultType,
+			FaultReported: row.FaultReported,
+			FaultOverdue:  row.FaultOverdue,
+			RepairNo:      row.RepairNo,
+			Repairman:     row.Repairman,
+			RepairStatus:  repairStatusLabel(row.RepairStatus),
+			RepairResult:  repair.ResultLabel(row.RepairResult),
+			RepairedAt:    row.RepairedAt,
+		})
+	}
+	return result
+}
+
+// faultStatusSafe 复用路灯运行状态的中文标签(状态值集合不同, 未知值原样返回)。
+func faultStatusSafe(value string) string {
+	switch value {
+	case "normal":
+		return "正常"
+	case "fault":
+		return "故障"
+	case "maintenance":
+		return "维修中"
+	case "offline":
+		return "停用"
+	default:
+		return value
+	}
+}
+
+func repairStatusLabel(value string) string {
+	if value == "" {
+		return ""
+	}
+	return repair.StatusLabel(value)
 }
 
 // Track 按故障 ID / 故障单号 / 路灯编号查询完整处理链路。
@@ -308,7 +408,7 @@ func (s *Service) Track(ctx context.Context, query TrackQuery) (*TrackResult, er
 			Lamp:          device,
 			Repairs:       make([]repair.Repair, 0),
 			Timeline:      make([]TimelineEvent, 0),
-			RelatedFaults: toBriefs(history),
+			RelatedFaults: toBriefs(history, time.Now().Add(-OverdueThreshold)),
 		}
 		if len(history) > 0 {
 			latest := history[0]
@@ -491,8 +591,9 @@ func topCounts(counts map[string]int64, limit int) []LabelCount {
 	return result
 }
 
-// toBriefs 将故障记录转换为摘要并计算已等待时长。
-func toBriefs(entities []fault.Fault) []FaultBrief {
+// toBriefs 将故障记录转换为摘要并计算已等待时长, overdueBefore 之前上报的
+// 未闭环故障统一标记为逾期, 与概览计数、路灯清单使用同一判定。
+func toBriefs(entities []fault.Fault, overdueBefore time.Time) []FaultBrief {
 	now := time.Now()
 	result := make([]FaultBrief, 0, len(entities))
 	for _, item := range entities {
@@ -506,6 +607,7 @@ func toBriefs(entities []fault.Fault) []FaultBrief {
 			Status:       item.Status,
 			ReportedAt:   item.ReportedAt,
 			WaitingHours: round2(now.Sub(item.ReportedAt).Hours()),
+			Overdue:      fault.IsOpen(item.Status) && item.ReportedAt.Before(overdueBefore),
 		})
 	}
 	return result
