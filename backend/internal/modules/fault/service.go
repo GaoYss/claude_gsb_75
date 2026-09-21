@@ -188,6 +188,7 @@ func (s *Service) Update(ctx context.Context, id uint, req UpdateRequest) (*Faul
 }
 
 // Close 关闭故障, 用于确认闭环或作废处理。
+// 状态推进通过条件更新原子完成, 并发重复关闭时仅一个请求成功, 其余收到 409。
 func (s *Service) Close(ctx context.Context, id uint, req CloseRequest) (*Fault, error) {
 	entity, err := s.repo.GetByID(ctx, id)
 	if err != nil {
@@ -196,18 +197,21 @@ func (s *Service) Close(ctx context.Context, id uint, req CloseRequest) (*Fault,
 	if entity.Status == StatusClosed {
 		return nil, apperr.Conflict("故障 %s 已关闭, 无需重复操作", entity.FaultNo)
 	}
-	if !canTransitTo(entity.Status, StatusClosed) {
-		return nil, apperr.Conflict("故障 %s 当前状态为 %s, 不允许关闭", entity.FaultNo, StatusLabel(entity.Status))
-	}
 
 	now := time.Now()
-	entity.Status = StatusClosed
-	entity.ClosedAt = &now
-	entity.CloseRemark = strings.TrimSpace(req.Remark)
-
-	if err := s.repo.Update(ctx, entity); err != nil {
+	remark := strings.TrimSpace(req.Remark)
+	affected, err := s.repo.CloseIfOpen(ctx, id, now, remark)
+	if err != nil {
 		return nil, err
 	}
+	if affected == 0 {
+		return nil, apperr.Conflict("故障 %s 已关闭, 无需重复操作", entity.FaultNo)
+	}
+
+	entity.Status = StatusClosed
+	entity.ClosedAt = &now
+	entity.CloseRemark = remark
+
 	if err := s.syncLampStatus(ctx, entity.LampID); err != nil {
 		slog.Warn("同步路灯运行状态失败", "lamp_id", entity.LampID, "fault_no", entity.FaultNo, "error", err)
 	}
@@ -246,6 +250,7 @@ func (s *Service) Metadata() *Meta {
 }
 
 // OnRepairStarted 维修开工: 故障进入维修中, 维修次数累加, 并同步路灯状态。
+// 状态推进通过条件更新原子完成, 并发下故障被关闭时本次开工整体失败。
 func (s *Service) OnRepairStarted(ctx context.Context, faultID uint, repairID uint) error {
 	entity, err := s.repo.GetByID(ctx, faultID)
 	if err != nil {
@@ -255,12 +260,16 @@ func (s *Service) OnRepairStarted(ctx context.Context, faultID uint, repairID ui
 		return apperr.Conflict("故障 %s 当前状态为 %s, 不允许开工维修", entity.FaultNo, StatusLabel(entity.Status))
 	}
 
-	entity.Status = StatusProcessing
-	entity.RepairCount++
-	entity.LatestRepairID = &repairID
-
-	if err := s.repo.Update(ctx, entity); err != nil {
+	affected, err := s.repo.StartRepairIfAllowed(ctx, faultID, repairID)
+	if err != nil {
 		return err
+	}
+	if affected == 0 {
+		latest, getErr := s.repo.GetByID(ctx, faultID)
+		if getErr != nil {
+			return getErr
+		}
+		return apperr.Conflict("故障 %s 当前状态为 %s, 不允许开工维修", latest.FaultNo, StatusLabel(latest.Status))
 	}
 	return s.syncLampStatus(ctx, entity.LampID)
 }
@@ -275,9 +284,16 @@ func (s *Service) OnRepairFinished(ctx context.Context, faultID uint, fixed bool
 		if !canTransitTo(entity.Status, StatusRepaired) {
 			return apperr.Conflict("故障 %s 当前状态为 %s, 无法标记为已修复", entity.FaultNo, StatusLabel(entity.Status))
 		}
-		entity.Status = StatusRepaired
-		if err := s.repo.Update(ctx, entity); err != nil {
+		affected, err := s.repo.MarkRepairedIfProcessing(ctx, faultID)
+		if err != nil {
 			return err
+		}
+		if affected == 0 {
+			latest, getErr := s.repo.GetByID(ctx, faultID)
+			if getErr != nil {
+				return getErr
+			}
+			return apperr.Conflict("故障 %s 当前状态为 %s, 无法标记为已修复", latest.FaultNo, StatusLabel(latest.Status))
 		}
 	}
 	return s.syncLampStatus(ctx, entity.LampID)

@@ -1,6 +1,7 @@
 <template>
   <div class="page">
     <PageHeader title="维修状态查询" description="按路灯维度查看当前故障与最近一次维修进展, 快速定位滞留工单">
+      <el-button :icon="Download" :loading="exporting" @click="exportCsv">导出</el-button>
       <el-button :icon="Refresh" @click="load">刷新</el-button>
     </PageHeader>
 
@@ -81,9 +82,10 @@
 </template>
 
 <script setup>
-import { onMounted } from 'vue'
+import { onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
-import { Refresh, RefreshLeft, Search } from '@element-plus/icons-vue'
+import { ElMessage } from 'element-plus'
+import { Download, Refresh, RefreshLeft, Search } from '@element-plus/icons-vue'
 import PageHeader from '@/components/common/PageHeader.vue'
 import StatusTag from '@/components/common/StatusTag.vue'
 import DataPagination from '@/components/common/DataPagination.vue'
@@ -102,6 +104,27 @@ const { loading, rows, total, query, load, search, reset, changePage, changePage
   run_status: '',
   only_open: false,
 })
+
+const exporting = ref(false)
+
+// 导出当前过滤条件下的全量维修状态清单。
+async function exportCsv() {
+  exporting.value = true
+  try {
+    const params = Object.fromEntries(Object.entries(query).filter(([, value]) => value !== '' && value !== false && value != null))
+    const blob = await statusApi.exportLamps(params)
+    const url = URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = `维修状态清单-${new Date().toISOString().slice(0, 10)}.csv`
+    link.click()
+    URL.revokeObjectURL(url)
+  } catch {
+    ElMessage.error('导出失败, 请稍后重试')
+  } finally {
+    exporting.value = false
+  }
+}
 
 function goTrack(params) {
   router.push({ path: '/status/track', query: params })

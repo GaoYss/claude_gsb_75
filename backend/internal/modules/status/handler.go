@@ -1,6 +1,8 @@
 package status
 
 import (
+	"net/http"
+
 	"github.com/gin-gonic/gin"
 
 	"streetlight/internal/httpx"
@@ -40,6 +42,22 @@ func (h *Handler) Lamps(c *gin.Context) {
 		return
 	}
 	response.OK(c, response.NewPageData(items, total, page.Page, page.PageSize))
+}
+
+// ExportLamps 导出路灯维修状态清单 CSV, 与列表共用同一套过滤与统计口径。
+func (h *Handler) ExportLamps(c *gin.Context) {
+	var query LampQuery
+	if err := httpx.BindQuery(c, &query); err != nil {
+		response.Fail(c, err)
+		return
+	}
+	data, err := h.service.ExportLamps(c.Request.Context(), query)
+	if err != nil {
+		response.Fail(c, err)
+		return
+	}
+	c.Header("Content-Disposition", `attachment; filename="repair-status.csv"`)
+	c.Data(http.StatusOK, "text/csv; charset=utf-8", data)
 }
 
 // Track 维修状态全链路追踪。

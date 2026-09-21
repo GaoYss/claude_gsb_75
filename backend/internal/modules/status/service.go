@@ -180,46 +180,58 @@ func (s *Service) Overview(ctx context.Context) (*Overview, error) {
 func (s *Service) Lamps(ctx context.Context, query LampQuery) ([]LampStatusRow, int64, pagination.Query, error) {
 	page := pagination.Parse(query.Params, lampStatusSortSpec)
 
-	base := func() *gorm.DB {
-		statement := s.db.WithContext(ctx).Model(&lamp.Lamp{})
-		if keyword := strings.TrimSpace(query.Keyword); keyword != "" {
-			like := "%" + keyword + "%"
-			statement = statement.Where(
-				"lamp.code LIKE ? OR lamp.name LIKE ? OR lamp.road_name LIKE ? OR lamp.address LIKE ?",
-				like, like, like, like,
-			)
-		}
-		if value := strings.TrimSpace(query.RoadName); value != "" {
-			statement = statement.Where("lamp.road_name = ?", value)
-		}
-		if value := strings.TrimSpace(query.LampType); value != "" {
-			statement = statement.Where("lamp.lamp_type = ?", value)
-		}
-		if value := strings.TrimSpace(query.RunStatus); value != "" {
-			statement = statement.Where("lamp.run_status = ?", value)
-		}
-		if query.OnlyOpen {
-			statement = statement.Where(
-				"EXISTS (SELECT 1 FROM fault WHERE fault.lamp_id = lamp.id AND fault.status IN ?)",
-				[]string{fault.StatusPending, fault.StatusProcessing},
-			)
-		}
-		return statement
-	}
-
 	var total int64
-	if err := base().Count(&total).Error; err != nil {
+	if err := s.lampFilter(ctx, query).Count(&total).Error; err != nil {
 		return nil, 0, page, err
 	}
 
 	devices := make([]lamp.Lamp, 0)
-	if err := base().Order(page.OrderClause()).Offset(page.Offset()).Limit(page.Limit()).Find(&devices).Error; err != nil {
+	if err := s.lampFilter(ctx, query).
+		Order(page.OrderClause()).Offset(page.Offset()).Limit(page.Limit()).
+		Find(&devices).Error; err != nil {
 		return nil, 0, page, err
 	}
 
+	rows, err := s.buildLampRows(ctx, devices)
+	if err != nil {
+		return nil, 0, page, err
+	}
+	return rows, total, page, nil
+}
+
+// lampFilter 按查询条件构造路灯查询, 列表与导出共用同一套过滤口径。
+func (s *Service) lampFilter(ctx context.Context, query LampQuery) *gorm.DB {
+	statement := s.db.WithContext(ctx).Model(&lamp.Lamp{})
+	if keyword := strings.TrimSpace(query.Keyword); keyword != "" {
+		like := "%" + keyword + "%"
+		statement = statement.Where(
+			"lamp.code LIKE ? OR lamp.name LIKE ? OR lamp.road_name LIKE ? OR lamp.address LIKE ?",
+			like, like, like, like,
+		)
+	}
+	if value := strings.TrimSpace(query.RoadName); value != "" {
+		statement = statement.Where("lamp.road_name = ?", value)
+	}
+	if value := strings.TrimSpace(query.LampType); value != "" {
+		statement = statement.Where("lamp.lamp_type = ?", value)
+	}
+	if value := strings.TrimSpace(query.RunStatus); value != "" {
+		statement = statement.Where("lamp.run_status = ?", value)
+	}
+	if query.OnlyOpen {
+		statement = statement.Where(
+			"EXISTS (SELECT 1 FROM fault WHERE fault.lamp_id = lamp.id AND fault.status IN ?)",
+			[]string{fault.StatusPending, fault.StatusProcessing},
+		)
+	}
+	return statement
+}
+
+// buildLampRows 为给定路灯组装维修状态行, 逾期判定与概览共用同一阈值口径。
+func (s *Service) buildLampRows(ctx context.Context, devices []lamp.Lamp) ([]LampStatusRow, error) {
 	rows := make([]LampStatusRow, 0, len(devices))
 	if len(devices) == 0 {
-		return rows, total, page, nil
+		return rows, nil
 	}
 
 	ids := make([]uint, 0, len(devices))
@@ -229,21 +241,22 @@ func (s *Service) Lamps(ctx context.Context, query LampQuery) ([]LampStatusRow, 
 
 	totalByLamp, err := s.countFaultsByLamp(ctx, ids, false)
 	if err != nil {
-		return nil, 0, page, err
+		return nil, err
 	}
 	openByLamp, err := s.countFaultsByLamp(ctx, ids, true)
 	if err != nil {
-		return nil, 0, page, err
+		return nil, err
 	}
 	currentFaults, err := s.currentFaults(ctx, ids)
 	if err != nil {
-		return nil, 0, page, err
+		return nil, err
 	}
 	latestRepairs, err := s.latestRepairs(ctx, ids)
 	if err != nil {
-		return nil, 0, page, err
+		return nil, err
 	}
 
+	now := time.Now()
 	for _, device := range devices {
 		row := LampStatusRow{
 			LampID:      device.ID,
@@ -263,6 +276,7 @@ func (s *Service) Lamps(ctx context.Context, query LampQuery) ([]LampStatusRow, 
 			row.FaultLevel = current.FaultLevel
 			row.FaultStatus = current.Status
 			row.FaultReported = &reportedAt
+			row.Overdue = IsOverdue(&current, now)
 		}
 		if latest, ok := latestRepairs[device.ID]; ok {
 			row.RepairNo = latest.RepairNo
@@ -273,7 +287,12 @@ func (s *Service) Lamps(ctx context.Context, query LampQuery) ([]LampStatusRow, 
 		}
 		rows = append(rows, row)
 	}
-	return rows, total, page, nil
+	return rows, nil
+}
+
+// IsOverdue 判定故障是否超期未处理: 仍处于待处理且上报时间早于阈值, 与概览的逾期口径一致。
+func IsOverdue(entity *fault.Fault, now time.Time) bool {
+	return entity.Status == fault.StatusPending && entity.ReportedAt.Before(now.Add(-OverdueThreshold))
 }
 
 // Track 按故障 ID / 故障单号 / 路灯编号查询完整处理链路。

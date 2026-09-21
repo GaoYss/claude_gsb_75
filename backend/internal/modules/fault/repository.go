@@ -51,6 +51,7 @@ func (r *Repository) Create(ctx context.Context, entity *Fault) error {
 }
 
 // CreateWithUniqueNo 生成唯一故障单号并落库, 单号冲突时自动重试。
+// "同一路灯仅允许一条未闭环故障"由部分唯一索引兜底, 命中时直接返回 409, 不参与单号重试。
 func (r *Repository) CreateWithUniqueNo(ctx context.Context, entity *Fault, prefix string) error {
 	for attempt := 0; attempt < 5; attempt++ {
 		sequence, err := r.NextSequence(ctx, prefix)
@@ -62,7 +63,10 @@ func (r *Repository) CreateWithUniqueNo(ctx context.Context, entity *Fault, pref
 		if err == nil {
 			return nil
 		}
-		if !isUniqueViolation(err) {
+		if isOpenFaultConflict(err) {
+			return apperr.Conflict("该路灯已存在未闭环故障, 请先处理后再登记")
+		}
+		if !isFaultNoConflict(err) {
 			return err
 		}
 	}
@@ -111,6 +115,49 @@ func (r *Repository) UpdateColumns(ctx context.Context, id uint, columns map[str
 		return apperr.NotFound("故障记录不存在: id=%d", id)
 	}
 	return nil
+}
+
+// CloseIfOpen 原子地将未关闭的故障置为已关闭, 返回受影响行数。
+// 返回 0 表示故障不存在或已被并发关闭, 由服务层转换为 409。
+func (r *Repository) CloseIfOpen(ctx context.Context, id uint, closedAt time.Time, remark string) (int64, error) {
+	result := r.session(ctx).Model(&Fault{}).
+		Where("id = ? AND status <> ?", id, StatusClosed).
+		Updates(map[string]any{
+			"status":       StatusClosed,
+			"closed_at":    closedAt,
+			"close_remark": remark,
+		})
+	if result.Error != nil {
+		return 0, fmt.Errorf("关闭故障失败: %w", result.Error)
+	}
+	return result.RowsAffected, nil
+}
+
+// StartRepairIfAllowed 原子地将故障推进为维修中并累加维修次数, 返回受影响行数。
+// 允许的来源状态与 canTransitTo(…, processing) 一致: 待处理 / 维修中 / 已修复(返修)。
+func (r *Repository) StartRepairIfAllowed(ctx context.Context, id uint, repairID uint) (int64, error) {
+	result := r.session(ctx).Model(&Fault{}).
+		Where("id = ? AND status IN ?", id, []string{StatusPending, StatusProcessing, StatusRepaired}).
+		Updates(map[string]any{
+			"status":           StatusProcessing,
+			"repair_count":     gorm.Expr("repair_count + 1"),
+			"latest_repair_id": repairID,
+		})
+	if result.Error != nil {
+		return 0, fmt.Errorf("联动故障开工失败: %w", result.Error)
+	}
+	return result.RowsAffected, nil
+}
+
+// MarkRepairedIfProcessing 原子地将维修中的故障推进为已修复, 返回受影响行数。
+func (r *Repository) MarkRepairedIfProcessing(ctx context.Context, id uint) (int64, error) {
+	result := r.session(ctx).Model(&Fault{}).
+		Where("id = ? AND status = ?", id, StatusProcessing).
+		Updates(map[string]any{"status": StatusRepaired})
+	if result.Error != nil {
+		return 0, fmt.Errorf("联动故障修复失败: %w", result.Error)
+	}
+	return result.RowsAffected, nil
 }
 
 // Delete 按主键删除故障。
@@ -265,13 +312,25 @@ func applyFilter(statement *gorm.DB, filter Filter) *gorm.DB {
 	return statement
 }
 
-// isUniqueViolation 兼容 sqlite 与 postgres 的唯一约束冲突判断。
-func isUniqueViolation(err error) bool {
+// isFaultNoConflict 判断唯一约束冲突是否来自故障单号, 此类冲突可通过换号重试解决。
+// sqlite 报告 "UNIQUE constraint failed: fault.fault_no", postgres 报告索引名 "idx_fault_fault_no"。
+func isFaultNoConflict(err error) bool {
 	if err == nil {
 		return false
 	}
 	message := strings.ToLower(err.Error())
-	return strings.Contains(message, "unique constraint failed") ||
-		strings.Contains(message, "duplicate key") ||
-		strings.Contains(message, "unique violation")
+	return strings.Contains(message, "fault_no")
+}
+
+// isOpenFaultConflict 判断唯一约束冲突是否来自"同一路灯仅一条未闭环故障"的部分索引。
+// sqlite 报告 "UNIQUE constraint failed: fault.lamp_id", postgres 报告索引名。
+func isOpenFaultConflict(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	if strings.Contains(message, "idx_fault_open_per_lamp") {
+		return true
+	}
+	return strings.Contains(message, "unique") && strings.Contains(message, "fault.lamp_id")
 }

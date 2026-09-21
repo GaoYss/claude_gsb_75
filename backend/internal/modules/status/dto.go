@@ -55,8 +55,8 @@ type RepairSummary struct {
 
 // Overview 维修状态总览看板。
 type Overview struct {
-	Lamp          LampSummary  `json:"lamp"`
-	Fault         FaultSummary `json:"fault"`
+	Lamp          LampSummary   `json:"lamp"`
+	Fault         FaultSummary  `json:"fault"`
 	Repair        RepairSummary `json:"repair"`
 	FaultByType   []LabelCount  `json:"fault_by_type"`
 	FaultByLevel  []LabelCount  `json:"fault_by_level"`
@@ -83,11 +83,13 @@ type LampStatusRow struct {
 	FaultLevel    string     `json:"current_fault_level"`
 	FaultStatus   string     `json:"current_fault_status"`
 	FaultReported *time.Time `json:"current_fault_reported_at"`
-	RepairNo      string     `json:"latest_repair_no"`
-	Repairman     string     `json:"latest_repairman"`
-	RepairStatus  string     `json:"latest_repair_status"`
-	RepairResult  string     `json:"latest_repair_result"`
-	RepairedAt    *time.Time `json:"latest_repaired_at"`
+	// Overdue 表示当前故障是否超期未处理, 与概览的逾期口径(待处理且超过 OverdueThreshold)一致。
+	Overdue      bool       `json:"overdue"`
+	RepairNo     string     `json:"latest_repair_no"`
+	Repairman    string     `json:"latest_repairman"`
+	RepairStatus string     `json:"latest_repair_status"`
+	RepairResult string     `json:"latest_repair_result"`
+	RepairedAt   *time.Time `json:"latest_repaired_at"`
 }
 
 // TimelineEvent 是维修状态追踪中的一个节点。
@@ -101,10 +103,10 @@ type TimelineEvent struct {
 
 // TrackResult 是单条故障(或单盏路灯)的完整处理链路。
 type TrackResult struct {
-	SearchType    string            `json:"search_type"`
-	Lamp          *lamp.Lamp        `json:"lamp,omitempty"`
-	Fault         *fault.Fault      `json:"fault,omitempty"`
-	Repairs       []repair.Repair   `json:"repairs"`
-	Timeline      []TimelineEvent   `json:"timeline"`
-	RelatedFaults []FaultBrief      `json:"related_faults,omitempty"`
+	SearchType    string          `json:"search_type"`
+	Lamp          *lamp.Lamp      `json:"lamp,omitempty"`
+	Fault         *fault.Fault    `json:"fault,omitempty"`
+	Repairs       []repair.Repair `json:"repairs"`
+	Timeline      []TimelineEvent `json:"timeline"`
+	RelatedFaults []FaultBrief    `json:"related_faults,omitempty"`
 }

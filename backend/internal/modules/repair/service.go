@@ -125,8 +125,12 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (*Repair, error
 		return nil, err
 	}
 
-	// 开工后: 故障转为维修中, 路灯转为维修状态
+	// 开工后: 故障转为维修中, 路灯转为维修状态。
+	// 联动失败时补偿删除已落库的维修记录, 保证失败的开工不留任何副作用。
 	if err := s.faults.OnRepairStarted(ctx, target.ID, entity.ID); err != nil {
+		if rbErr := s.repo.Delete(ctx, entity.ID); rbErr != nil {
+			slog.Warn("开工失败回滚维修记录失败", "repair_id", entity.ID, "error", rbErr)
+		}
 		return nil, err
 	}
 
@@ -185,6 +189,8 @@ func (s *Service) Update(ctx context.Context, id uint, req UpdateRequest) (*Repa
 }
 
 // Finish 完成维修: 记录结果与完工时间, 结果为已修复时联动故障转为已修复。
+// 完工通过条件更新原子完成, 并发重复提交时仅一个请求成功;
+// 故障联动失败时回滚维修记录, 保证失败的完工不留任何副作用。
 func (s *Service) Finish(ctx context.Context, id uint, req FinishRequest) (*Repair, error) {
 	entity, err := s.repo.GetByID(ctx, id)
 	if err != nil {
@@ -207,27 +213,46 @@ func (s *Service) Finish(ctx context.Context, id uint, req FinishRequest) (*Repa
 		return nil, apperr.BadRequest("完工时间不能早于开工时间")
 	}
 
+	// 先快照原始记录, 联动失败时整体回滚。
+	original := *entity
+
+	columns := map[string]any{
+		"finished_at": finishedAt,
+		"status":      StatusFinished,
+		"result":      result,
+	}
 	entity.FinishedAt = &finishedAt
 	entity.Status = StatusFinished
 	entity.Result = result
 	if content := strings.TrimSpace(req.Content); content != "" {
+		columns["content"] = content
 		entity.Content = content
 	}
 	if materials := strings.TrimSpace(req.Materials); materials != "" {
+		columns["materials"] = materials
 		entity.Materials = materials
 	}
 	if req.Cost != nil {
+		columns["cost"] = *req.Cost
 		entity.Cost = *req.Cost
 	}
 	if remark := strings.TrimSpace(req.Remark); remark != "" {
+		columns["remark"] = remark
 		entity.Remark = remark
 	}
 
-	if err := s.repo.Update(ctx, entity); err != nil {
+	affected, err := s.repo.FinishIfOngoing(ctx, id, columns)
+	if err != nil {
 		return nil, err
+	}
+	if affected == 0 {
+		return nil, apperr.Conflict("维修记录 %s 已完成, 不允许重复提交", entity.RepairNo)
 	}
 
 	if err := s.faults.OnRepairFinished(ctx, entity.FaultID, result == ResultFixed); err != nil {
+		if rbErr := s.repo.Update(ctx, &original); rbErr != nil {
+			slog.Warn("完工失败回滚维修记录失败", "repair_id", id, "error", rbErr)
+		}
 		return nil, err
 	}
 

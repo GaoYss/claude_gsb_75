@@ -39,6 +39,20 @@ func IsValidRunStatus(status string) bool {
 	return false
 }
 
+// RunStatusLabel 返回运行状态的中文名称, 未知取值原样返回。
+func RunStatusLabel(status string) string {
+	labels := map[string]string{
+		RunStatusNormal:      "正常",
+		RunStatusFault:       "故障",
+		RunStatusMaintenance: "维修中",
+		RunStatusOffline:     "停用",
+	}
+	if label, ok := labels[status]; ok {
+		return label
+	}
+	return status
+}
+
 // Lamp 路灯台账, 记录每盏路灯的基础档案与当前运行状态。
 type Lamp struct {
 	ID          uint       `gorm:"primaryKey" json:"id"`

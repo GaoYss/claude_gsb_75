@@ -50,6 +50,7 @@ func (r *Repository) Create(ctx context.Context, entity *Repair) error {
 }
 
 // CreateWithUniqueNo 生成唯一维修单号并落库, 冲突时自动重试。
+// "同一故障仅允许一条进行中维修"由部分唯一索引兜底, 命中时直接返回 409, 不参与单号重试。
 func (r *Repository) CreateWithUniqueNo(ctx context.Context, entity *Repair, prefix string) error {
 	for attempt := 0; attempt < 5; attempt++ {
 		sequence, err := r.NextSequence(ctx, prefix)
@@ -61,7 +62,10 @@ func (r *Repository) CreateWithUniqueNo(ctx context.Context, entity *Repair, pre
 		if err == nil {
 			return nil
 		}
-		if !isUniqueViolation(err) {
+		if isOngoingConflict(err) {
+			return apperr.Conflict("故障 %s 已有进行中的维修记录, 请先完成后再录入", entity.FaultNo)
+		}
+		if !isRepairNoConflict(err) {
 			return err
 		}
 	}
@@ -95,6 +99,18 @@ func (r *Repository) Update(ctx context.Context, entity *Repair) error {
 		return fmt.Errorf("更新维修记录失败: %w", err)
 	}
 	return nil
+}
+
+// FinishIfOngoing 原子地完成进行中的维修记录, 返回受影响行数。
+// 返回 0 表示记录不存在或已被并发完成, 由服务层转换为 409。
+func (r *Repository) FinishIfOngoing(ctx context.Context, id uint, columns map[string]any) (int64, error) {
+	result := r.session(ctx).Model(&Repair{}).
+		Where("id = ? AND status = ?", id, StatusOngoing).
+		Updates(columns)
+	if result.Error != nil {
+		return 0, fmt.Errorf("完成维修记录失败: %w", result.Error)
+	}
+	return result.RowsAffected, nil
 }
 
 // Delete 按主键删除维修记录。
@@ -282,7 +298,7 @@ func (r *Repository) AverageDurationHours(ctx context.Context) (float64, error) 
 func (r *Repository) DistinctValues(ctx context.Context, column string) ([]string, error) {
 	values := make([]string, 0)
 	err := r.session(ctx).Model(&Repair{}).
-		Where(column + " <> ''").
+		Where(column+" <> ''").
 		Distinct().
 		Order(column).
 		Pluck(column, &values).Error
@@ -328,13 +344,25 @@ func applyFilter(statement *gorm.DB, filter Filter) *gorm.DB {
 	return statement
 }
 
-// isUniqueViolation 兼容 sqlite 与 postgres 的唯一约束冲突判断。
-func isUniqueViolation(err error) bool {
+// isRepairNoConflict 判断唯一约束冲突是否来自维修单号, 此类冲突可通过换号重试解决。
+// sqlite 报告 "UNIQUE constraint failed: repair.repair_no", postgres 报告索引名 "idx_repair_repair_no"。
+func isRepairNoConflict(err error) bool {
 	if err == nil {
 		return false
 	}
 	message := strings.ToLower(err.Error())
-	return strings.Contains(message, "unique constraint failed") ||
-		strings.Contains(message, "duplicate key") ||
-		strings.Contains(message, "unique violation")
+	return strings.Contains(message, "repair_no")
+}
+
+// isOngoingConflict 判断唯一约束冲突是否来自"同一故障仅一条进行中维修"的部分索引。
+// sqlite 报告 "UNIQUE constraint failed: repair.fault_id", postgres 报告索引名。
+func isOngoingConflict(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	if strings.Contains(message, "idx_repair_ongoing_per_fault") {
+		return true
+	}
+	return strings.Contains(message, "unique") && strings.Contains(message, "repair.fault_id")
 }

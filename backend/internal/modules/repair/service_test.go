@@ -15,6 +15,7 @@ import (
 	"streetlight/internal/modules/fault"
 	"streetlight/internal/modules/lamp"
 	"streetlight/internal/modules/repair"
+	"streetlight/internal/modules/status"
 )
 
 // harness 使用内存数据库装配真实模块, 用于验证跨模块业务流程。
@@ -22,6 +23,7 @@ type harness struct {
 	lamps   *lamp.Service
 	faults  *fault.Service
 	repairs *repair.Service
+	status  *status.Service
 	db      *gorm.DB
 }
 
@@ -50,7 +52,13 @@ func newHarness(t *testing.T) *harness {
 	repairRepository := repair.NewRepository(db)
 	repairService := repair.NewService(repairRepository, faultService)
 
-	return &harness{lamps: lampService, faults: faultService, repairs: repairService, db: db}
+	return &harness{
+		lamps:   lampService,
+		faults:  faultService,
+		repairs: repairService,
+		status:  status.NewService(db, lampRepository, faultRepository, repairRepository),
+		db:      db,
+	}
 }
 
 func (h *harness) createLamp(t *testing.T, code string) *lamp.Lamp {

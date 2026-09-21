@@ -84,9 +84,11 @@ func canTransitTo(from, to string) bool {
 
 // Fault 故障登记记录, 串联路灯台账与维修记录。
 type Fault struct {
-	ID             uint       `gorm:"primaryKey" json:"id"`
-	FaultNo        string     `gorm:"size:64;uniqueIndex;not null" json:"fault_no"`
-	LampID         uint       `gorm:"index;not null" json:"lamp_id"`
+	ID      uint   `gorm:"primaryKey" json:"id"`
+	FaultNo string `gorm:"size:64;uniqueIndex;not null" json:"fault_no"`
+	// LampID 上的部分唯一索引保证"同一路灯至多一条未闭环故障"在并发下也成立,
+	// 服务层先做预检查, 索引作为兜底, 冲突时返回 409。
+	LampID         uint       `gorm:"index;not null;index:idx_fault_open_per_lamp,unique,where:status = 'pending' OR status = 'processing'" json:"lamp_id"`
 	LampCode       string     `gorm:"size:64;index" json:"lamp_code"`
 	RoadName       string     `gorm:"size:128;index" json:"road_name"`
 	FaultType      string     `gorm:"size:32;index;not null" json:"fault_type"`
